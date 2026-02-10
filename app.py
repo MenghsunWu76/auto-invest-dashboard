@@ -2,82 +2,104 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import yfinance as yf
+import twstock
 
 # --- 1. 頁面基礎設定 ---
-st.set_page_config(page_title="全天候戰情室 (Auto)", layout="wide")
-st.title("🛡️ 全天候動態曝險系統 (自動報價版)")
-st.caption("核心：MDD 階梯加碼 + 閥值再平衡 + 自動抓取股價")
+st.set_page_config(page_title="全天候戰情室 (Pro)", layout="wide")
+st.title("🛡️ 全天候動態曝險系統 (即時零延遲版)")
+st.caption("核心：twstock 即時報價 + 雙重備援機制 + 自動 MDD 計算")
 
-# --- 2. 自動化數據抓取引擎 ---
-@st.cache_data(ttl=60) # 設定 60 秒快取，避免頻繁請求卡住
-def get_market_data():
-    # 定義代號對照表 (Yahoo Finance 代碼)
-    tickers = {
-        "00675L": "00675L.TW",
-        "00631L": "00631L.TW",
-        "00670L": "00670L.TW",
-        "00662": "00662.TW",
-        "00713": "00713.TW",
-        "00865B": "00865B.TW",
-        "00948B": "00948B.TW",
-        "INDEX": "^TWII"  # 台灣加權指數
-    }
+# --- 2. 雙重數據抓取引擎 (Hybrid Engine) ---
+@st.cache_data(ttl=30) # 縮短快取時間到 30 秒，因為是即時報價
+def get_realtime_data():
+    # 定義持股清單 (台股代號)
+    tw_tickers = ['00675L', '00631L', '00670L', '00662', '00713', '00865B', '00948B']
     
-    # 批量下載數據
-    data = yf.download(list(tickers.values()), period="1d", progress=False)['Close']
-    
-    # 處理最新的價格 (取得最後一筆非空值)
+    # 結果儲存容器
     latest_prices = {}
-    for key, symbol in tickers.items():
-        try:
-            # 兼容 yfinance 不同版本的格式
-            if isinstance(data, pd.DataFrame):
-                 # 檢查是否為多層索引 (MultiIndex)
-                if isinstance(data.columns, pd.MultiIndex):
-                    price = data[symbol].iloc[-1]
-                else:
-                    # 單層索引直接取值
-                    price = data[symbol].iloc[-1]
-            else:
-                 # 若非 DataFrame (極少見)，嘗試直接取值
-                 price = data.iloc[-1]
-                 
-            # 轉換為浮點數
-            latest_prices[key] = float(price)
-        except Exception as e:
-            latest_prices[key] = 0.0 # 若抓取失敗歸零
-            # print(f"Error fetching {key}: {e}") # Debug用
+    
+    # === A 計畫: 使用 twstock 抓取即時報價 (優先) ===
+    try:
+        # twstock 支援一次抓多檔 (realtime.get)
+        stocks = twstock.realtime.get(tw_tickers)
+        
+        for code, info in stocks.items():
+            if info['success']:
+                # 嘗試取得最新成交價 (realtime -> latest_trade_price)
+                # 若剛開盤無成交，改拿開盤價或昨日收盤
+                price = info['realtime'].get('latest_trade_price', None)
+                if not price or price == '-':
+                    price = info['realtime'].get('best_bid_price', [None])[0] # 最佳買價
+                
+                if price and price != '-':
+                    latest_prices[code] = float(price)
+    except Exception as e:
+        st.toast(f"twstock 連線異常，切換備援: {e}", icon="⚠️")
 
-    # 特別處理：抓取大盤歷史高點 (ATH) - 抓過去 5 年數據
+    # === B 計畫: 使用 yfinance 補救 (備援 & 大盤) ===
+    # 檢查哪些還沒抓到，以及抓大盤
+    missing_tickers = [t for t in tw_tickers if t not in latest_prices]
+    yf_tickers = [f"{t}.TW" for t in missing_tickers] + ["^TWII"]
+    
+    if yf_tickers:
+        try:
+            yf_data = yf.download(yf_tickers, period="1d", progress=False)['Close']
+            
+            # 處理大盤
+            if "^TWII" in yf_tickers:
+                # 兼容不同格式
+                try:
+                    idx_price = yf_data["^TWII"].iloc[-1] if isinstance(yf_data, pd.DataFrame) else yf_data.iloc[-1]
+                    latest_prices["INDEX"] = float(idx_price)
+                except:
+                    latest_prices["INDEX"] = 0.0
+
+            # 處理補救的個股
+            for t in missing_tickers:
+                symbol = f"{t}.TW"
+                try:
+                    price = yf_data[symbol].iloc[-1] if isinstance(yf_data, pd.DataFrame) else yf_data.iloc[-1]
+                    latest_prices[t] = float(price)
+                except:
+                    latest_prices[t] = 0.0 # 真的抓不到就歸零
+                    
+        except Exception as e:
+            st.error(f"yfinance 備援也失敗: {e}")
+
+    # 特別處理：抓取大盤歷史高點 (ATH) - 用 yfinance 抓 5 年
     try:
         hist = yf.Ticker("^TWII").history(period="5y")
         ath = float(hist['High'].max())
     except:
-        ath = 32996.0 # 預設值 (若抓取失敗)
+        ath = 32996.0 # 預設值
 
     return latest_prices, ath
 
-# 執行抓取 (顯示 Loading 狀態)
-with st.spinner('正在連線 Yahoo Finance 抓取最新報價...'):
-    prices, ath_index = get_market_data()
+# 執行抓取 (顯示動態狀態)
+with st.spinner('正在連線台灣證交所抓取即時報價...'):
+    prices, ath_index = get_realtime_data()
 
-# --- 3. 側邊欄：只輸入持股數 ---
+# --- 3. 側邊欄：個人持股設定 ---
 with st.sidebar:
     st.header("👤 個人持股設定")
-    st.caption("股價已自動更新，僅需確認股數")
     
     # 顯示大盤資訊
     current_index = prices.get("INDEX", 0)
     
     # 計算 MDD
-    if ath_index > 0:
+    if ath_index > 0 and current_index > 0:
         mdd_pct = ((ath_index - current_index) / ath_index) * 100
     else:
-        mdd_pct = 0.0
+        mdd_pct = 0.0 # 若抓取失敗
     
-    st.info(f"📊 加權指數: {current_index:,.0f}\n\n📉 目前 MDD: -{mdd_pct:.2f}%")
+    if current_index > 0:
+        st.info(f"📊 加權指數: {current_index:,.0f}\n\n📉 目前 MDD: -{mdd_pct:.2f}%")
+    else:
+        st.error("⚠️ 無法取得大盤指數，請檢查網路")
 
     with st.form("holdings_form"):
+        st.caption("股價來源: 證交所即時 (twstock)")
+        
         st.subheader("1. 攻擊型 (股數)")
         s_675 = st.number_input("00675L 持股", value=11000, step=1000)
         s_631 = st.number_input("00631L 持股", value=331, step=100)
@@ -122,7 +144,7 @@ else: target_attack_ratio, current_tier_index = 50.0, 5
 
 current_tier_name = ladder_data[current_tier_index]["位階"]
 
-# C. 計算資產市值 (使用自動抓取的 prices)
+# C. 計算資產市值 (使用 prices 字典)
 v_675 = prices.get("00675L", 0) * s_675
 v_631 = prices.get("00631L", 0) * s_631
 v_670 = prices.get("00670L", 0) * s_670
@@ -174,7 +196,7 @@ with m3:
 
 st.divider()
 
-# === 區塊二：投資組合核心數據 ===
+# === 區塊二：核心數據監控 ===
 st.header("2. 核心數據監控")
 col1, col2, col3, col4 = st.columns(4)
 
@@ -183,7 +205,7 @@ col2.metric("📉 Beta", f"{portfolio_beta:.2f}", "目標: 1.05~1.2")
 
 t_color = "normal"
 if maintenance_ratio < 250: t_color = "inverse"
-elif maintenance_ratio < 300: t_color = "off" # 灰色或黃色概念
+elif maintenance_ratio < 300: t_color = "off"
 col3.metric("🛡️ 維持率", f"{maintenance_ratio:.0f}%", "安全 > 300%", delta_color=t_color)
 
 l_color = "normal"
@@ -212,7 +234,6 @@ with c2:
     is_safe_t = maintenance_ratio >= 300
     is_safe_u = loan_ratio <= 35
     
-    # 邏輯判斷
     if maintenance_ratio < 250:
         st.error("⛔ **紅色警戒**\n\n維持率危險！禁止買進，立即還款。")
     elif (not is_safe_t) or (not is_safe_u):
@@ -221,7 +242,6 @@ with c2:
              sell_amt = val_attack - (total_assets * target_attack_ratio / 100)
              st.info(f"💡 **減壓機會**：賣出 ${sell_amt:,.0f} 正二還債！")
     else:
-        # 安全狀態下的再平衡
         if gap > threshold:
             sell_amt = val_attack - (total_assets * target_attack_ratio / 100)
             st.warning(f"🔴 **賣出訊號**\n\n攻擊過高 (+{gap:.1f}%)。\n賣出 ${sell_amt:,.0f} 轉入子彈庫。")
@@ -232,6 +252,11 @@ with c2:
             st.success(f"✅ **系統完美**\n\n無偏離，財務健康。\n持續持有。")
 
 # 自動展開詳細股價 (供查驗)
-with st.expander("🔎 查看自動抓取的即時股價"):
-    price_df = pd.DataFrame(list(prices.items()), columns=['代號', '現價'])
-    st.dataframe(price_df)
+with st.expander("🔎 查看自動抓取的即時股價 (來源: 證交所/Yahoo)"):
+    # 標示資料來源
+    source_data = []
+    for t in ['00675L', '00631L', '00670L', '00662', '00713', '00865B', '00948B']:
+        price = prices.get(t, 0)
+        source_data.append({"代號": t, "現價": price})
+    
+    st.dataframe(pd.DataFrame(source_data))
